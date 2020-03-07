@@ -5,11 +5,13 @@ import (
 	"fmt"
 	"github.com/PuerkitoBio/goquery"
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api"
-	"html/template"
 	"io"
 	"log"
 	"net/http"
 	"os"
+	"strconv"
+	"strings"
+	"text/template"
 	"time"
 )
 
@@ -36,9 +38,15 @@ var Log = log.New(os.Stdout, "[ncov-change-notif] ", log.LstdFlags)
 var ErrorLog = log.New(MultiLogDest, "[ERROR] [ncov-change-notif] ", log.LstdFlags)
 
 // Category -> Key:Value
-var Cache = map[string]map[string]string{}
+var Cache = map[string]map[string]int{}
 
 var Bot *tgbotapi.BotAPI
+
+
+type Diff struct {
+	Current int
+	Diff string
+}
 
 func parse(r io.Reader) string {
 	doc, err := goquery.NewDocumentFromReader(r)
@@ -46,41 +54,73 @@ func parse(r io.Reader) string {
 		ErrorLog.Printf("failed to init goquery doc: %v", err)
 	}
 
+	diff := map[string]map[string]Diff{}
+
 	needUpdate := false
+	firstRun := false
 
 	tags := doc.Find("#stat").Find(".tag")
 	tags.Each(func(i int, selection *goquery.Selection) {
 		category := selection.Find("strong").Text()
+		category = strings.ReplaceAll(category, "确诊", "")
 		selection.Find("dl").Each(func(i int, selection *goquery.Selection) {
 			term := selection.Find("dt").Text()
 			def := selection.Find("dd").Text()
-			if o, ok := Cache[category][term]; !ok || o != def {
-				if _, ok := Cache[category]; !ok {
-					Cache[category] = map[string]string{}
-				}
-				Cache[category][term] = def
+			o := Cache[category][term]
+			defInt, err := strconv.Atoi(def)
+			if err != nil {
+				ErrorLog.Printf("cannot conv %v to int: %v", def, err)
+			}
+
+			if o != defInt {
 				needUpdate = true
+				if _, ok := Cache[category]; !ok {
+					Cache[category] = map[string]int{}
+					needUpdate = false
+					firstRun = true
+				}
+				Cache[category][term] = defInt
+
+				if _, ok := diff[category]; !ok {
+					diff[category] = map[string]Diff{}
+				}
+
+				diffValue := defInt - o
+				var diffText string
+				if diffValue > 0 {
+					diffText = fmt.Sprintf("增加了%d", diffValue)
+				} else {
+					diffText = fmt.Sprintf("减少了%d", -diffValue)
+				}
+				diff[category][term] = Diff{
+					Current: defInt,
+					Diff:    diffText,
+				}
 			}
 		})
 	})
 
-	tmpl := template.Must(template.New("TgUpdate").Parse(`*数据更新*
-{{range $k, $v := .Cache}}
-*{{$k}}*{{range $kk, $vv := $v}}
-  — {{$kk}}: *{{$vv}}*{{end}}
+	tmpl := template.Must(template.New("TgUpdate").Parse(`**概览**
+{{range $k, $v := .Diff}}{{range $kk, $vv := $v}}*{{$k}}*的{{$kk}}人数*{{$vv.Diff}}* ({{$vv.Current}})；
+{{end}}{{end}}
+**现总计**
+{{range $k, $v := .Cache}}  *{{$k}}*{{range $kk, $vv := $v}}
+    — {{$kk}}：*{{$vv}}*{{end}}
 {{end}}
 `))
 	s := bytes.NewBufferString("")
 	err = tmpl.Execute(s, struct {
-		Cache map[string]map[string]string
+		Cache map[string]map[string]int
+		Diff map[string]map[string]Diff
 	}{
 		Cache: Cache,
+		Diff: diff,
 	})
 	if err != nil {
 		ErrorLog.Printf("failed to exec tmpl: %v", err)
 	}
 
-	if needUpdate {
+	if needUpdate && !firstRun {
 		Log.Printf("have change; sending update.")
 		return s.String()
 	} else {
@@ -97,6 +137,7 @@ func update() {
 		return
 	}
 	s := parse(resp.Body)
+	fmt.Println(s)
 	if s != "" {
 		m := tgbotapi.NewMessage(TelegramChatId, s)
 		m.ParseMode = tgbotapi.ModeMarkdown
@@ -114,7 +155,7 @@ func main() {
 		ErrorLog.Printf("failed to init bot: %v", err)
 	}
 	update()
-	t := time.NewTicker(time.Minute * 10)
+	t := time.NewTicker(time.Minute * 5)
 	for {
 		select {
 		case <-t.C:
@@ -122,3 +163,4 @@ func main() {
 		}
 	}
 }
+
